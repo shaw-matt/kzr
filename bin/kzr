@@ -1,0 +1,358 @@
+#!/usr/bin/env bash
+# kzr — kiro-zellij-restore
+# Capture and restore Kiro CLI chats across zellij panes, so an unexpected
+# restart doesn't lose which agent/chat was running where.
+#
+# Subcommands:
+#   agent [LABEL] [-- kiro args...]   Launch (or resume) a Kiro chat pinned to this pane
+#   snapshot [SESSION]                Snapshot the current zellij layout + pins
+#   restore [SESSION] [--print]       Rebuild a zellij layout that resumes each pinned chat
+#   status [SESSION]                  Show captured pane→session pins
+#   doctor                            Check dependencies + hook wiring
+#   install-hook [--agent NAME|--all] Wire the agentSpawn capture hook into agent config(s)
+#   prune [--days N]                  Drop pins whose Kiro session no longer exists / is old
+#   version | help
+set -euo pipefail
+
+KZR_VERSION="0.1.0"
+
+# ------------------------------------------------------------------ paths ----
+KZR_HOME="${KZR_HOME:-$HOME/.kiro-zellij}"
+PINS="$KZR_HOME/pins.json"
+REGISTRY="$KZR_HOME/registry.jsonl"
+SNAP_DIR="$KZR_HOME/snapshots"
+LAYOUT_DIR="$KZR_HOME/layouts"
+KIRO_SESS_DIR="${KIRO_SESSIONS_DIR:-$HOME/.kiro/sessions/cli}"
+KIRO_AGENTS_DIR="${KIRO_AGENTS_DIR:-$HOME/.kiro/agents}"
+
+KIRO_BIN="${KZR_KIRO_BIN:-kiro-cli}"
+# Resolve where this script lives so we can find the bundled hook.
+_self="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+HOOK_SRC_CANDIDATES=(
+  "$_self/../hooks/kzr-record.sh"
+  "$_self/../libexec/kzr-record.sh"
+  "$KZR_HOME/kzr-record.sh"
+)
+
+# ---------------------------------------------------------------- helpers ----
+err()  { printf 'kzr: %s\n' "$*" >&2; }
+die()  { err "$*"; exit 1; }
+info() { printf '%s\n' "$*"; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+_ensure_dirs() { mkdir -p "$KZR_HOME" "$SNAP_DIR" "$LAYOUT_DIR"; [ -s "$PINS" ] || printf '{}\n' >"$PINS"; }
+
+_need_jq() { have jq || die "jq is required (install with: brew install jq)"; }
+
+_hook_path() {
+  # Prefer an installed copy in KZR_HOME, else the repo copy.
+  if [ -x "$KZR_HOME/kzr-record.sh" ]; then printf '%s\n' "$KZR_HOME/kzr-record.sh"; return 0; fi
+  local c
+  for c in "${HOOK_SRC_CANDIDATES[@]}"; do
+    [ -f "$c" ] && { printf '%s\n' "$c"; return 0; }
+  done
+  return 1
+}
+
+_kiro_session_exists() {
+  # $1 = uuid; true if its metadata file is present.
+  [ -n "${1:-}" ] && [ -f "$KIRO_SESS_DIR/$1.json" ]
+}
+
+# ------------------------------------------------------------- subcommands ---
+cmd_agent() {
+  # Launch or resume a Kiro chat pinned to (zellij_session, label).
+  local label="" ; local -a extra=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --) shift; extra=("$@"); break ;;
+      -h|--help) info "usage: kzr agent [LABEL] [-- kiro-cli args...]"; return 0 ;;
+      *) if [ -z "$label" ]; then label="$1"; else extra+=("$1"); fi ;;
+    esac
+    shift
+  done
+
+  local zs="${ZELLIJ_SESSION_NAME:-}"
+  [ -n "$zs" ] || err "not inside a zellij session (ZELLIJ_SESSION_NAME unset) — launching without a pin"
+
+  # Default label: current directory basename (stable per worktree),
+  # else the zellij pane id.
+  if [ -z "$label" ]; then
+    label="$(basename "$PWD" 2>/dev/null || echo pane)"
+    [ -n "${ZELLIJ_PANE_ID:-}" ] && label="${label}-p${ZELLIJ_PANE_ID}"
+  fi
+  export KZR_LABEL="$label"   # the agentSpawn hook reads this
+
+  local resume_id=""
+  if [ -n "$zs" ] && have jq && [ -s "$PINS" ]; then
+    resume_id="$(jq -r --arg k "$zs/$label" '.[$k].session_id // empty' "$PINS" 2>/dev/null || true)"
+  fi
+
+  if [ -n "$resume_id" ] && _kiro_session_exists "$resume_id"; then
+    info "kzr: resuming chat for '$zs/$label' (session $resume_id)"
+    exec "$KIRO_BIN" chat --resume-id "$resume_id" "${extra[@]}"
+  fi
+  info "kzr: starting new chat for '$zs/$label' (will be captured on spawn)"
+  exec "$KIRO_BIN" chat "${extra[@]}"
+}
+
+cmd_status() {
+  _need_jq
+  local zs="${1:-}"
+  [ -s "$PINS" ] || { info "no pins yet ($PINS)"; return 0; }
+  info "Captured pane→session pins ($PINS):"
+  local filter='to_entries'
+  if [ -n "$zs" ]; then filter="$filter | map(select(.value.zellij_session==\"$zs\"))"; fi
+  jq -r "$filter"' | .[] | .value | "  \(.zellij_session)/\(.label)\t\(.session_id)\t\(.cwd)\t\(.updated_at)"' "$PINS" \
+    | while IFS=$'\t' read -r key sid cwd ts; do
+        local mark="  ok"
+        _kiro_session_exists "$sid" || mark="MISSING"
+        printf '  %-28s %s  %-8s %s  %s\n' "$key" "$sid" "$mark" "$ts" "$cwd"
+      done
+}
+
+cmd_snapshot() {
+  _ensure_dirs
+  local zs="${1:-${ZELLIJ_SESSION_NAME:-}}"
+  [ -n "$zs" ] || die "no zellij session given and ZELLIJ_SESSION_NAME unset"
+  have zellij || die "zellij not found"
+  local out="$SNAP_DIR/$zs.kdl"
+  # dump-layout captures live pane geometry, cwds, and running commands.
+  if zellij --session "$zs" action dump-layout >"$out" 2>/dev/null || zellij action dump-layout >"$out" 2>/dev/null; then
+    info "kzr: wrote layout snapshot -> $out"
+  else
+    err "could not dump-layout for session '$zs' (is it running/attached?)"
+  fi
+  # Also freeze the current pins for this session.
+  if have jq && [ -s "$PINS" ]; then
+    jq --arg zs "$zs" 'to_entries|map(select(.value.zellij_session==$zs))|from_entries' "$PINS" \
+      > "$SNAP_DIR/$zs.pins.json" 2>/dev/null || true
+    info "kzr: wrote pins snapshot   -> $SNAP_DIR/$zs.pins.json"
+  fi
+}
+
+_gen_layout() {
+  # Emit a zellij KDL layout (one tab per pinned agent) to stdout.
+  # $1 = zellij session name; uses pins for that session.
+  local zs="$1"
+  local self_agent="kzr"
+  have "$self_agent" || self_agent="$_self/kzr"   # fall back to in-repo path
+  printf 'layout {\n'
+  jq -r --arg zs "$zs" \
+     'to_entries
+      | map(select(.value.zellij_session==$zs))
+      | sort_by(.value.label)
+      | .[] | .value | [.label, .cwd, .session_id] | @tsv' "$PINS" 2>/dev/null \
+  | while IFS=$'\t' read -r label cwd sid; do
+      [ -n "$label" ] || continue
+      printf '    tab name="%s" {\n' "$label"
+      if [ -n "$cwd" ]; then
+        printf '        pane cwd="%s" command="%s" {\n' "$cwd" "$self_agent"
+      else
+        printf '        pane command="%s" {\n' "$self_agent"
+      fi
+      printf '            args "agent" "%s"\n' "$label"
+      printf '        }\n    }\n'
+    done
+  printf '}\n'
+}
+
+cmd_restore() {
+  _need_jq; _ensure_dirs
+  local zs="" print_only=0 native=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --print) print_only=1 ;;
+      --native) native=1 ;;
+      -h|--help) info "usage: kzr restore [SESSION] [--print] [--native]"; return 0 ;;
+      *) zs="$1" ;;
+    esac
+    shift
+  done
+  zs="${zs:-${ZELLIJ_SESSION_NAME:-}}"
+  [ -n "$zs" ] || die "no session given and ZELLIJ_SESSION_NAME unset. Try: kzr status"
+
+  # Native path: let zellij resurrect geometry; panes running `kzr agent` self-resume.
+  if [ "$native" = 1 ]; then
+    have zellij || die "zellij not found"
+    info "kzr: attaching (resurrecting) zellij session '$zs'…"
+    exec zellij attach "$zs"
+  fi
+
+  local count
+  count="$(jq -r --arg zs "$zs" 'to_entries|map(select(.value.zellij_session==$zs))|length' "$PINS" 2>/dev/null || echo 0)"
+  [ "${count:-0}" -gt 0 ] || die "no pins for session '$zs'. Run 'kzr status' to see what's captured."
+
+  local layout="$LAYOUT_DIR/$zs.restore.kdl"
+  _gen_layout "$zs" > "$layout"
+
+  if [ "$print_only" = 1 ]; then
+    info "# generated layout for '$zs' ($count agents) -> $layout"
+    cat "$layout"
+    return 0
+  fi
+
+  have zellij || die "zellij not found"
+  local target="${zs}-restored"
+  info "kzr: launching zellij session '$target' from $count captured chats…"
+  exec zellij --session "$target" --layout "$layout"
+}
+
+cmd_install_hook() {
+  _ensure_dirs
+  _need_jq
+  local mode="all" name=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --agent) mode="one"; name="${2:-}"; shift ;;
+      --all) mode="all" ;;
+      -h|--help) info "usage: kzr install-hook [--all | --agent NAME]"; return 0 ;;
+      *) : ;;
+    esac
+    shift
+  done
+
+  # Install a copy of the hook into KZR_HOME so it has a stable absolute path.
+  local hook_src; hook_src="$(_hook_path)" || die "cannot locate kzr-record.sh"
+  cp "$hook_src" "$KZR_HOME/kzr-record.sh"
+  chmod +x "$KZR_HOME/kzr-record.sh"
+  local hook_cmd="$KZR_HOME/kzr-record.sh"
+
+  local -a targets=()
+  if [ "$mode" = one ]; then
+    [ -n "$name" ] || die "--agent requires a NAME"
+    targets=("$KIRO_AGENTS_DIR/$name.json")
+  else
+    if [ -d "$KIRO_AGENTS_DIR" ]; then
+      while IFS= read -r f; do targets+=("$f"); done < <(find "$KIRO_AGENTS_DIR" -maxdepth 1 -name '*.json' 2>/dev/null)
+    fi
+  fi
+
+  if [ "${#targets[@]}" -eq 0 ]; then
+    err "no agent config files found in $KIRO_AGENTS_DIR"
+    err "Kiro's built-in default agent has no editable config; create one and re-run, e.g.:"
+    err "    kiro-cli agent create --name kzr    # then: kzr install-hook --agent kzr"
+    err "    launch chats with:  kzr agent <label> -- --agent kzr"
+    return 1
+  fi
+
+  local f
+  for f in "${targets[@]}"; do
+    [ -f "$f" ] || { err "skip (not found): $f"; continue; }
+    local tmp; tmp="$(mktemp)"
+    # Merge our agentSpawn hook (object format) idempotently; don't duplicate.
+    if jq --arg cmd "$hook_cmd" '
+        .hooks =
+          (if (.hooks|type)=="object" then .hooks
+           elif (.hooks|type)=="array" then (reduce .hooks[] as $h ({}; .))  # arrays: leave as-is below
+           else {} end)
+        | .hooks.agentSpawn = ((.hooks.agentSpawn // [])
+            | map(select((.command? // "") | test("kzr-record\\.sh")|not))
+            + [{command:$cmd}])
+      ' "$f" >"$tmp" 2>/dev/null; then
+      mv "$tmp" "$f"
+      info "kzr: wired agentSpawn hook into $f"
+    else
+      rm -f "$tmp"
+      err "could not patch $f (array-format hooks or invalid JSON?) — add manually:"
+      err "    \"hooks\": { \"agentSpawn\": [ { \"command\": \"$hook_cmd\" } ] }"
+    fi
+  done
+  info "kzr: hook command -> $hook_cmd"
+}
+
+cmd_prune() {
+  _need_jq; _ensure_dirs
+  local days=0
+  while [ $# -gt 0 ]; do case "$1" in --days) days="${2:-0}"; shift ;; esac; shift; done
+  [ -s "$PINS" ] || { info "nothing to prune"; return 0; }
+  local tmp; tmp="$(mktemp)"; local removed=0
+  # Drop pins whose Kiro session file no longer exists.
+  jq -r 'to_entries|.[]|[.key,.value.session_id]|@tsv' "$PINS" | while IFS=$'\t' read -r k sid; do
+    if ! _kiro_session_exists "$sid"; then printf '%s\n' "$k"; fi
+  done > "$tmp.dead" || true
+  if [ -s "$tmp.dead" ]; then
+    jq --slurpfile _ /dev/null 'del(.[$k])' "$PINS" >/dev/null 2>&1 || true
+    # delete each dead key
+    cp "$PINS" "$tmp"
+    while IFS= read -r k; do
+      jq --arg k "$k" 'del(.[$k])' "$tmp" > "$tmp.2" && mv "$tmp.2" "$tmp"
+      removed=$((removed+1))
+    done < "$tmp.dead"
+    mv "$tmp" "$PINS"
+    info "kzr: pruned $removed stale pin(s) whose Kiro session no longer exists"
+  else
+    info "kzr: no stale pins"
+    rm -f "$tmp"
+  fi
+  rm -f "$tmp.dead" "$tmp.2" 2>/dev/null || true
+}
+
+cmd_doctor() {
+  local ok=0 warn=0
+  _check() { # label, condition-cmd...
+    local label="$1"; shift
+    if "$@" >/dev/null 2>&1; then printf '  [ok]   %s\n' "$label"; ok=$((ok+1));
+    else printf '  [WARN] %s\n' "$label"; warn=$((warn+1)); fi
+  }
+  info "kiro-zellij-restore doctor (v$KZR_VERSION)"
+  _check "jq installed" have jq
+  _check "zellij installed" have zellij
+  _check "kiro-cli present ($KIRO_BIN)" have "$KIRO_BIN"
+  _check "inside a zellij session (ZELLIJ_SESSION_NAME)" test -n "${ZELLIJ_SESSION_NAME:-}"
+  _check "Kiro sessions dir exists ($KIRO_SESS_DIR)" test -d "$KIRO_SESS_DIR"
+  _check "state dir exists ($KZR_HOME)" test -d "$KZR_HOME"
+  _check "capture hook installed ($KZR_HOME/kzr-record.sh)" test -x "$KZR_HOME/kzr-record.sh"
+  # Is the hook wired into any agent?
+  if [ -d "$KIRO_AGENTS_DIR" ] && have jq; then
+    if grep -lR "kzr-record.sh" "$KIRO_AGENTS_DIR"/*.json >/dev/null 2>&1; then
+      printf '  [ok]   agentSpawn hook wired into: %s\n' "$(grep -lR "kzr-record.sh" "$KIRO_AGENTS_DIR"/*.json 2>/dev/null | xargs -n1 basename 2>/dev/null | tr '\n' ' ')"
+      ok=$((ok+1))
+    else
+      printf '  [WARN] hook not wired into any agent (run: kzr install-hook)\n'; warn=$((warn+1))
+    fi
+  fi
+  local n=0; [ -s "$PINS" ] && n="$(jq 'length' "$PINS" 2>/dev/null || echo 0)"
+  printf '  [info] %s pin(s) captured\n' "$n"
+  printf '\n%s ok, %s warning(s)\n' "$ok" "$warn"
+}
+
+usage() {
+  cat <<'EOF'
+kzr — kiro-zellij-restore: resume your Kiro chats + zellij layout after a crash.
+
+USAGE
+  kzr agent [LABEL] [-- kiro-cli args...]   Launch/resume a Kiro chat pinned to this pane
+  kzr snapshot [SESSION]                    Snapshot current zellij layout + pins
+  kzr restore  [SESSION] [--print|--native] Rebuild a layout that resumes each pinned chat
+  kzr status   [SESSION]                    Show captured pane→session pins
+  kzr install-hook [--all|--agent NAME]     Wire the agentSpawn capture hook into agent(s)
+  kzr prune    [--days N]                   Remove stale pins
+  kzr doctor                                Check dependencies + wiring
+  kzr version | help
+
+QUICK START
+  1) ./install.sh                # installs kzr + capture hook, wires your agents
+  2) launch each agent with:  kzr agent <label>     (e.g. kzr agent api)
+  3) after a reboot:          kzr restore <session>  (or: kzr restore --native <session>)
+
+State lives in ~/.kiro-zellij  (override with $KZR_HOME).
+EOF
+}
+
+main() {
+  local sub="${1:-help}"; shift || true
+  case "$sub" in
+    agent)        cmd_agent "$@" ;;
+    snapshot)     cmd_snapshot "$@" ;;
+    restore)      cmd_restore "$@" ;;
+    status|ls)    cmd_status "$@" ;;
+    install-hook) cmd_install_hook "$@" ;;
+    prune)        cmd_prune "$@" ;;
+    doctor)       cmd_doctor "$@" ;;
+    version|-V|--version) info "kzr $KZR_VERSION" ;;
+    help|-h|--help) usage ;;
+    *) err "unknown subcommand: $sub"; usage; exit 2 ;;
+  esac
+}
+main "$@"

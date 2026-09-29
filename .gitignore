@@ -1,0 +1,9 @@
+# kzr runtime state (never commit a user's captured sessions)
+.kiro-zellij/
+*.pins.json
+*.restore.kdl
+snapshot.log
+
+# OS / editor noise
+.DS_Store
+*.swp

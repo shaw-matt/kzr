@@ -214,7 +214,9 @@ cmd_install_hook() {
 
   # Install a copy of the hook into KZR_HOME so it has a stable absolute path.
   local hook_src; hook_src="$(_hook_path)" || die "cannot locate kzr-record.sh"
-  cp "$hook_src" "$KZR_HOME/kzr-record.sh"
+  if ! [ "$hook_src" -ef "$KZR_HOME/kzr-record.sh" ]; then
+    cp "$hook_src" "$KZR_HOME/kzr-record.sh"
+  fi
   chmod +x "$KZR_HOME/kzr-record.sh"
   local hook_cmd="$KZR_HOME/kzr-record.sh"
 
@@ -240,21 +242,28 @@ cmd_install_hook() {
   for f in "${targets[@]}"; do
     [ -f "$f" ] || { err "skip (not found): $f"; continue; }
     local tmp; tmp="$(mktemp)"
-    # Merge our agentSpawn hook (object format) idempotently; don't duplicate.
+    # Merge our agentSpawn hook idempotently, preserving the file's existing
+    # hook FORMAT (object vs array) and never dropping existing hooks.
     if jq --arg cmd "$hook_cmd" '
-        .hooks =
-          (if (.hooks|type)=="object" then .hooks
-           elif (.hooks|type)=="array" then (reduce .hooks[] as $h ({}; .))  # arrays: leave as-is below
-           else {} end)
-        | .hooks.agentSpawn = ((.hooks.agentSpawn // [])
-            | map(select((.command? // "") | test("kzr-record\\.sh")|not))
-            + [{command:$cmd}])
-      ' "$f" >"$tmp" 2>/dev/null; then
+        if (.hooks|type)=="array" then
+          # Array format: drop any prior kzr entry, then append one.
+          .hooks = ((.hooks // [])
+            | map(select(((.action.command? // .command? // "")) | test("kzr-record\\.sh") | not))
+            + [{name:"kzr-capture", trigger:"agentSpawn",
+                action:{type:"command", command:$cmd}}])
+        else
+          # Object format (or no hooks yet): dedup within agentSpawn, then append.
+          .hooks = ((.hooks // {}))
+          | .hooks.agentSpawn = (((.hooks.agentSpawn) // [])
+              | map(select((.command? // "") | test("kzr-record\\.sh") | not))
+              + [{command:$cmd}])
+        end
+      ' "$f" >"$tmp" 2>/dev/null && [ -s "$tmp" ]; then
       mv "$tmp" "$f"
       info "kzr: wired agentSpawn hook into $f"
     else
       rm -f "$tmp"
-      err "could not patch $f (array-format hooks or invalid JSON?) — add manually:"
+      err "could not patch $f (invalid JSON?) — add manually:"
       err "    \"hooks\": { \"agentSpawn\": [ { \"command\": \"$hook_cmd\" } ] }"
     fi
   done

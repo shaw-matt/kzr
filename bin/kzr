@@ -90,10 +90,10 @@ cmd_agent() {
 
   if [ -n "$resume_id" ] && _kiro_session_exists "$resume_id"; then
     info "kzr: resuming chat for '$zs/$label' (session $resume_id)"
-    exec "$KIRO_BIN" chat --resume-id "$resume_id" "${extra[@]}"
+    exec "$KIRO_BIN" chat --resume-id "$resume_id" ${extra[@]+"${extra[@]}"}
   fi
   info "kzr: starting new chat for '$zs/$label' (will be captured on spawn)"
-  exec "$KIRO_BIN" chat "${extra[@]}"
+  exec "$KIRO_BIN" chat ${extra[@]+"${extra[@]}"}
 }
 
 cmd_status() {
